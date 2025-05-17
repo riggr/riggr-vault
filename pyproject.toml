@@ -1,6 +1,6 @@
 [project]
 name = "riggr-vault"
-version = "0.1.8"
+version = "0.2.0"
 description = "Client library for OpenBao vault"
 authors = [
     {name = "turiyadev", email = "code@turiya.dev"}
@@ -14,7 +14,17 @@ dependencies = [
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.3.5"
+pytest-asyncio = "^0.26.0"
+pytest-cov = "^6.1.1"
+pytest-mock = "^3.14.0"
+respx = "^0.22.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov=riggr_vault --cov-report=term-missing --cov-report=html"

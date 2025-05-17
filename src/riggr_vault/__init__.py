@@ -1,4 +1,4 @@
-from .client import VaultClient
-from .lib import read_cubbyhole, write_cubbyhole
+from .app_client import VaultAppClient
+from .thin_client import VaultThinClient
 
-__all__ = ["VaultClient", "read_cubbyhole", "write_cubbyhole"]
+__all__ = ["VaultAppClient", "VaultThinClient"]

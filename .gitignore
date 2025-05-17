@@ -1,2 +1,9 @@
-.venv
-__pycache__
+.venv/
+.pytest_cache/
+__pycache__/
+
+.coverage
+htmlcov/
+
+.DS_Store
+

@@ -1,13 +1,13 @@
-"""Utilities for authenticating with an OpenBao vault"""
 import asyncio
-import time
-from typing import Optional, Dict, List, Callable, Any
 import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
-from httpx import AsyncClient, HTTPStatusError
+from typing import Optional, Dict, List, Callable, Any
+from httpx import HTTPStatusError
+from .thin_client import VaultThinClient
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 class CredentialType(Enum):
     DATABASE = "database"
@@ -22,8 +22,26 @@ class Credential:
     data: Optional[Dict[str, Any]] = None
     expires_at: Optional[float] = None
 
-class VaultClient:
-    """Client for interacting with OpenBao vault"""
+class VaultAppClient(VaultThinClient):
+    """
+    Client for authenticated OpenBao vault operations. The client does not have full API
+    coverage, only a subset of operations are implemented as required by the Riggr platform.
+    
+    This client manages authentication and automatic credential renewal.
+    It should be used as an async context manager to ensure proper cleanup of resources:
+    
+    ```python
+    async with VaultClient(url, role_id, secret_id) as client:
+        credentials = await client.get_database_credentials("my-role")
+    ```
+    
+    The context manager will automatically:
+    - Cancel all renewal tasks
+    - Close the underlying HTTP client
+    - Clean up any cached credentials
+    
+    If not used as a context manager, you must call `close()` manually to prevent resource leaks.
+    """
     
     DEFAULT_AUTH_TTL = 3600  # 1 hour
     DEFAULT_CRED_TTL = 2764800  # 32 days
@@ -38,28 +56,33 @@ class VaultClient:
             role_id: AppRole role ID
             secret_id: AppRole secret ID
         """
-        if not url or not role_id or not secret_id:
-            raise ValueError("url, role_id and secret_id are required")
-        self.url = url
+        if not role_id or not secret_id:
+            raise ValueError("AppRole credentials are required")
         self.role_id = role_id
-        self.secret_id = secret_id
+        self._secret_id = secret_id
+        self.credentials: dict[str, Credential] = {}
         self._auth_token: Optional[str] = None
-        self.credentials: Dict[str, Credential] = {}
         self._renewals: List[asyncio.Task] = []
-        self._httpx = AsyncClient(base_url=url)
+        super().__init__(url)
     
     async def close(self):
         """Stop all renewal tasks and close the client"""
-        for task in self._renewals:
-            task.cancel()
+        if self._renewals:  
+            for task in self._renewals:
+                task.cancel()
         
-        if self._httpx:
-            await self._httpx.close()
+        await super().close()
     
-    async def authenticate(self) -> str:
+    async def authenticate(self) -> str | None:
         """
-        Authenticate with OpenBao using AppRole and return the token
+        Authenticate with OpenBao using AppRole and return the token.
+
+        Although this can be called directly, it is generally not necessary
+        as the client will automatically authenticate when needed.
         """
+        if not self.role_id or not self._secret_id:
+            raise ValueError("This operation requires AppRole credentials")
+
         logger.info("Authenticating with OpenBao AppRole")
         
         try:
@@ -67,7 +90,7 @@ class VaultClient:
                 "/v1/auth/approle/login",
                 json={
                     "role_id": self.role_id,
-                    "secret_id": self.secret_id
+                    "secret_id": self._secret_id
                 }
             )
             response.raise_for_status()
@@ -176,7 +199,7 @@ class VaultClient:
         
         try:
             response = await self._httpx.get(
-                f"{self.url}/v1/{cred_path}",
+                f"/v1/{cred_path}",
                 headers={"X-Vault-Token": self._auth_token}
             )
             response.raise_for_status()
@@ -238,7 +261,7 @@ class VaultClient:
         
         try:
             response = await self._httpx.post(
-                f"{self.url}/v1/sys/leases/renew",
+                f"/v1/sys/leases/renew",
                 json={"lease_id": credential.lease_id},
                 headers={"X-Vault-Token": self._auth_token}
             )
@@ -303,7 +326,7 @@ class VaultClient:
         
         try:
             response = await self._httpx.get(
-                f"{self.url}/v1/{mount_path}/metadata/{path}",
+                f"/v1/{mount_path}/metadata/{path}",
                 headers={"X-Vault-Token": self._auth_token}
             )
             response.raise_for_status()
@@ -319,7 +342,7 @@ class VaultClient:
         
         try:
             response = await self._httpx.get(
-                f"{self.url}/v1/{mount_path}/data/{path}{f'?version={version}' if version else ''}",
+                f"/v1/{mount_path}/data/{path}{f'?version={version}' if version else ''}",
                 headers={"X-Vault-Token": self._auth_token}
             )
             response.raise_for_status()
@@ -335,7 +358,7 @@ class VaultClient:
         
         try:
             response = await self._httpx.post(
-                f"{self.url}/v1/{mount_path}/data/{path}",
+                f"/v1/{mount_path}/data/{path}",
                 headers={"X-Vault-Token": self._auth_token},
                 json=data
             )
@@ -345,6 +368,20 @@ class VaultClient:
             logger.error(f"Error creating secret for {path}: {e.response.text if hasattr(e, 'response') else str(e)}")
             raise
     
+    async def write_cubbyhole(self, path: str, data: Dict[str, Any], token: str = None) -> None:
+        """Write data to a cubbyhole, either using the provided token or the current auth token"""
+        if not token and not self._auth_token:
+            await self.authenticate()
+
+        await super().write_cubbyhole(path, data, token or self._auth_token)
+    
+    async def read_cubbyhole(self, path: str, token: str = None) -> Dict[str, Any]:
+        """Read data from a cubbyhole, either using the provided token or the current auth token"""
+        if not token and not self._auth_token:
+            await self.authenticate()
+
+        return await super().read_cubbyhole(path, token or self._auth_token)
+    
     async def create_orphan_token(self, ttl: str = "1h", policies: List[str] = []) -> Dict[str, Any]:
         """Create a new token for the specified role"""
         if not self._auth_token:
@@ -352,7 +389,7 @@ class VaultClient:
         
         try:
             response = await self._httpx.post(
-                f"{self.url}/v1/auth/token/create-orphan",
+                f"/v1/auth/token/create-orphan",
                 headers={"X-Vault-Token": self._auth_token},
                 json={
                     "policies": policies,
@@ -364,4 +401,3 @@ class VaultClient:
         except HTTPStatusError as e:
             logger.error(f"Error creating orphan token: {e.response.text if hasattr(e, 'response') else str(e)}")
             raise
-
